@@ -19,4 +19,4 @@ This is a generic "error" indicator. Try the following checklist:
 
 ## License
 
-This code is released under the GPLv3 license.
+This code is released under the GPLv3 license, except where noted.
