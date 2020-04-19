@@ -169,7 +169,7 @@ void fetch_weather() {
   HTTPClient http;
   BearSSL::WiFiClientSecure bear = BearSSL::WiFiClientSecure();
   bear.setCertStore(&certStore);
-  if (http.begin(dynamic_cast<WiFiClient&>(bear), _path)) {
+  if (http.begin(bear, _path)) {
     http.addHeader("User-Agent", "ESP8266");
     http.addHeader("Connection", "close");
     int code = http.GET();
