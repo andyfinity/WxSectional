@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <FastLED.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <CertStoreBearSSL.h>
 #include <map>
@@ -21,7 +22,6 @@
 #define UPDATE_MINUTES 5
 
 Ticker led_updater;
-Ticker brightness_updater;
 CRGB led_current[NUM_LEDS];
 CRGB led_target[NUM_LEDS];
 typedef enum {
@@ -33,10 +33,8 @@ typedef enum {
 } led_mode_t;
 led_mode_t led_mode = led_mode_t::OFF;
 
-String host = "www.aviationweather.gov";
-const int https_port = 443;
 // Note: DO NOT use the "fields" argument. As of April 2020, it is broken.
-String path = "/adds/dataserver_current/httpparam?dataSource=metars&requestType=retrieve&format=csv&mostRecentForEachStation=true&hoursBeforeNow=1.25&stationString=";
+String url = "https://www.aviationweather.gov/adds/dataserver_current/httpparam?dataSource=metars&requestType=retrieve&format=csv&mostRecentForEachStation=true&hoursBeforeNow=1.25&stationString=";
 BearSSL::CertStore certStore;
 
 std::map<String, CRGB> cat_lut {
@@ -81,8 +79,6 @@ std::map<String, int> station_lut {
 // Some LEDs might be backwards. We should ignore them in animations.
 const std::vector<int> led_ignore { 27 };
 
-int atoi( const char*);
-
 /**
  * @brief Read a comma-delimited string looking for specific information.
  * 
@@ -90,7 +86,7 @@ int atoi( const char*);
  * @param station Station identifier
  * @param cat Weather category
  */
-void line_parse(String line, String& station, String& cat)
+void line_parse(String &line, String& station, String& cat)
 {
   int i = 0;
   int start = 0;
@@ -113,62 +109,7 @@ void line_parse(String line, String& station, String& cat)
   }
 }
 
-/**
- * @brief Retrieve the weather and load the colors into the color target array.
- */
-void fetch_weather() {
-  auto _path = path;
-  for (auto const& imap : station_lut) {
-    _path.concat(imap.first + ",");
-  }
-  Serial.printf("https://%s%s\n", host.c_str(), _path.c_str());
-
-  // TODO: Move to HTTPClient for proper certificate checking. See https://medium.com/@dfa_31434/doing-ssl-requests-on-esp8266-correctly-c1f60ad46f5e
-  WiFiClientSecure client;
-  client.setInsecure(); // Don't verify fingerprint
-  if (!client.connect(host, https_port)) {
-    Serial.println("Wx fetch could not connect to https://" + host);
-    return;
-  }
-
-  client.print(String("GET ") + _path + " HTTP/1.1\r\n" +
-               "Host: " + host + "\r\n" +
-               "User-Agent: ESP8266\r\n" +
-               "Connection: close\r\n\r\n");
-
-  // Ignore HTTP headers
-  // TODO: Check for "200 OK"
-  while (client.connected()) {
-    auto line = client.readStringUntil('\n');
-    if (line == "\r") {
-      break;
-    }
-    Serial.println(line);
-  }
-
-  // Data statistics (mostly ignored)
-  String errors = client.readStringUntil('\n');
-  String warnings = client.readStringUntil('\n');
-  String duration = client.readStringUntil('\n');
-  String data_source = client.readStringUntil('\n');
-  String num_results = client.readStringUntil('\n');
-
-  if (errors != "No errors") Serial.println("Server returned an error: " + errors);
-  if (warnings != "No warnings") Serial.println("Server returned a warning: " + warnings);
-  Serial.print(num_results.toInt());
-  Serial.println(" stations");
-  Serial.print(duration);
-  Serial.println(" server time");
-
-  if (errors != "No errors") {
-    led_mode = led_mode_t::ERROR;
-    Serial.println("!!! Aborting due to server error. !!!");
-    return;
-  }
-
-  // Ignore column headers (assume the format won't change)
-  String col_headers = client.readStringUntil('\n');
-
+void payload_proc(const char *payload) {
   // Initialize a buffer for LED colors
   static CRGB led_tmp[NUM_LEDS];
   for (int i = 0; i < NUM_LEDS; i++) {
@@ -178,29 +119,75 @@ void fetch_weather() {
   // Disable the loading colors
   led_mode = led_mode_t::WX;
 
-  // Loop over lines
-  while (client.connected()) {
-    String line = client.readStringUntil('\n');
-    line.trim();
-    Serial.printf(" %s\n", line.c_str());
-
-    // Fetch the relevant tokens in the line
-    String station;
-    String category;
-    line_parse(line, station, category);
-    Serial.printf(" %s %s\n", station.c_str(), category.c_str());
-
-    // If the station is in our list, give it a color
-    if (station_lut.find(station) != station_lut.end()) {
-      auto color = cat_lut.find(category) != cat_lut.end() ? cat_lut[category] : CRGB::Black;
-      led_tmp[station_lut[station]] = color;
-      Serial.printf("  color (%d, %d, %d)\n", color.r, color.g, color.b);
+  int line_no = 0;
+  char *tok = strtok((char *) payload, "\n");
+  while (tok != nullptr) {
+    if (line_no == 0) { // Errors
+      if (strcmp(tok, "No errors") != 0) {
+        Serial.println(tok);
+      }
     }
+    else if (line_no == 1) { // Warnings
+      if (strcmp(tok, "No warnings") != 0) {
+        Serial.println(tok);
+      }
+    }
+    else if (line_no == 4) { // Num results
+      // Ignore for now
+    }
+    else if (line_no >= 6) { // Result lines
+      String station, category;
+      String Tok(tok);
+      line_parse(Tok, station, category);
+
+      // If the station is in our list, give it a color
+      if (station_lut.find(station) != station_lut.end()) {
+        auto color = cat_lut.find(category) != cat_lut.end() ? cat_lut[category] : CRGB::Black;
+        led_tmp[station_lut[station]] = color;
+      }
+    }
+
+    ++line_no;
+    tok = strtok(nullptr, "\n");
   }
 
   // Copy the local LED color buffer to the target for display
   for (int i = 0; i < NUM_LEDS; i++) {
     led_target[i] = led_tmp[i];
+  }
+}
+
+/**
+ * @brief Retrieve the weather and load the colors into the color target array.
+ */
+void fetch_weather() {
+  auto _path = url;
+  for (auto const& imap : station_lut) {
+    _path.concat(imap.first + ",");
+  }
+
+  HTTPClient http;
+  BearSSL::WiFiClientSecure bear = BearSSL::WiFiClientSecure();
+  bear.setCertStore(&certStore);
+  if (http.begin(dynamic_cast<WiFiClient&>(bear), _path)) {
+    http.addHeader("User-Agent", "ESP8266");
+    http.addHeader("Connection", "close");
+    int code = http.GET();
+    if (code == HTTP_CODE_OK || code == HTTP_CODE_MOVED_PERMANENTLY) {
+      auto payload = http.getString();
+      payload_proc(payload.c_str());
+    }
+    else {
+      led_mode = led_mode_t::ERROR;
+      Serial.print("!!! Error: server returned with code ");
+      Serial.print(code);
+      Serial.println(". !!!");
+    }
+    http.end();
+  }
+  else {
+    led_mode = led_mode_t::ERROR;
+    Serial.println("!!! Error: no connection to server. !!!");
   }
 }
 
@@ -271,31 +258,21 @@ void led_update_handler() {
     }
   }
 
-  FastLED.show();
-}
-
-/**
- * @brief Monitor brightness.
- * 
- * TODO: Consider moving this to led_update_handler(). Requires changing some time constants.
- */
-void brightness_update_handler() {
   auto b = analogRead(LIGHT_SENSOR);
   const int min_ = 18;
   const int max_ = 255;
 
   float target = constrain(map(b, 1024, 800, min_, max_), min_, max_);
   static float current = 0;
-  current = (current * 0.9f) + (target * 0.1f);
+  current = (current * 0.97f) + (target * 0.03f);
   FastLED.setBrightness(current);
+
+  FastLED.show();
 }
 
 void setup() {
-  delay(1000);
   Serial.begin(115200);
   Serial.println("WxSectional JAX");
-
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT);
@@ -310,13 +287,13 @@ void setup() {
     led_target[i] = CRGB::Black;
   }
   FastLED.show();
-  led_mode = led_mode_t::OFF;
+  led_mode = led_mode_t::WAIT;
   led_updater.attach_ms(20, led_update_handler);
-  brightness_updater.attach_ms(100, brightness_update_handler);
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoConnect(true);
   WiFi.setAutoReconnect(true);
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   SPIFFS.begin();
   int num_certs = certStore.initCertStore(SPIFFS, "/certs.idx", "/certs.ar");
@@ -369,7 +346,7 @@ void loop() {
       smart_config = false;
       Serial.println("WiFi connected!");
 
-      led_mode == led_mode_t::WAIT;
+      led_mode = led_mode_t::WAIT;
       updated_at = LONG_MIN;
     }
     else if ((millis() - smart_config_started_at) >= (60 * 1000)) {
