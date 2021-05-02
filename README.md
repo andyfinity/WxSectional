@@ -4,7 +4,7 @@ A high-quality FAA sectional poster showing weather conditions. This repository 
 
 This was intended as a sectional map, but it can of course be used with any type of map. Other similar maps exist on the internet: [LiveSectional](http://www.livesectional.com/), [LED Sectional Project](https://led-sectional.kyleharmon.com/), and [METARmaps](https://metarmaps.squarespace.com/), to name a few. None of them quite fit my requirements, and I wanted to use a map that I had used for a checkride, so I made my own.
 
-![Florida, demonstrating why people live in Florida](demo.jpg)
+![Jacksonville sectional, demonstrating why people live in Florida](demo.jpg)
 
 ## Features
 

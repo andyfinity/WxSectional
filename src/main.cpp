@@ -19,7 +19,20 @@
 #define BUTTON_PIN 0
 
 #define LED_STEP_SIZE 10
-#define UPDATE_MINUTES 5
+#define UPDATE_MINUTES 10
+
+// When errors happen, retry in the following way.
+#define ERROR_BACKOFF_FACTOR 2
+#define ERROR_BACKOFF_MIN 10
+#define ERROR_BACKOFF_MAX 180
+int error_delay = ERROR_BACKOFF_MIN;
+
+// Menu states
+int menu = 0;
+int wifi_scan_num_results = -1;
+char wifi_ssid[65] = {0};
+char menu_buf[33] = {0};
+int menu_buf_len = 0;
 
 Ticker led_updater;
 CRGB led_current[NUM_LEDS];
@@ -34,7 +47,7 @@ typedef enum {
 led_mode_t led_mode = led_mode_t::OFF;
 
 // Note: DO NOT use the "fields" argument. As of April 2020, it is broken.
-String url = "https://www.aviationweather.gov/adds/dataserver_current/httpparam?dataSource=metars&requestType=retrieve&format=csv&mostRecentForEachStation=true&hoursBeforeNow=1.25&stationString=";
+String url = "https://www.aviationweather.gov/adds/dataserver_current/httpparam?dataSource=metars&requestType=retrieve&format=csv&mostRecentForEachStation=true&hoursBeforeNow=2&stationString=";
 BearSSL::CertStore certStore;
 
 std::map<String, CRGB> cat_lut {
@@ -76,7 +89,7 @@ std::map<String, int> station_lut {
   {"KLAL", 20} 
 };
 
-// Some LEDs might be backwards. We should ignore them in animations.
+// Some LEDs might be mounted backwards. We should ignore them in animations.
 const std::vector<int> led_ignore { 27 };
 
 /**
@@ -119,21 +132,31 @@ void payload_proc(const char *payload) {
   // Disable the loading colors
   led_mode = led_mode_t::WX;
 
+  // Track stations we have and have not updated
+  std::vector<String> stations_updated, stations_stale, stations_no_cat;
+  stations_stale.reserve(station_lut.size());
+  for (auto it = station_lut.begin(); it != station_lut.end(); ++it) {
+    stations_stale.push_back(it->first);
+  }
+
   int line_no = 0;
   char *tok = strtok((char *) payload, "\n");
   while (tok != nullptr) {
-    if (line_no == 0) { // Errors
-      if (strcmp(tok, "No errors") != 0) {
-        Serial.println(tok);
-      }
-    }
-    else if (line_no == 1) { // Warnings
-      if (strcmp(tok, "No warnings") != 0) {
-        Serial.println(tok);
-      }
-    }
-    else if (line_no == 4) { // Num results
-      // Ignore for now
+    // if (line_no == 0) { // Errors
+    //   if (strcmp(tok, "No errors") != 0) {
+    //     Serial.println(tok);
+    //   }
+    // }
+    // else if (line_no == 1) { // Warnings
+    //   if (strcmp(tok, "No warnings") != 0) {
+    //     Serial.println(tok);
+    //   }
+    // }
+    // else if (line_no == 4) { // Num results
+    //   Serial.println(tok);
+    // }
+    if (line_no < 5) {
+      Serial.println(tok);
     }
     else if (line_no >= 6) { // Result lines
       String station, category;
@@ -142,8 +165,20 @@ void payload_proc(const char *payload) {
 
       // If the station is in our list, give it a color
       if (station_lut.find(station) != station_lut.end()) {
-        auto color = cat_lut.find(category) != cat_lut.end() ? cat_lut[category] : CRGB::Black;
-        led_tmp[station_lut[station]] = color;
+        CRGB color;
+        if (cat_lut.find(category) != cat_lut.end()) {
+          led_tmp[station_lut[station]] = cat_lut[category];
+        }
+        else {
+          stations_no_cat.push_back(station);
+        }
+      }
+
+      // Remove it from the "stale" list and add it to the "updated" list
+      auto it = find(stations_stale.begin(), stations_stale.end(), station);
+      if (it != stations_stale.end()) {
+        stations_updated.push_back(*it);
+        stations_stale.erase(it);
       }
     }
 
@@ -155,12 +190,35 @@ void payload_proc(const char *payload) {
   for (int i = 0; i < NUM_LEDS; i++) {
     led_target[i] = led_tmp[i];
   }
+
+  // Print statistics
+  {
+    String buf = " Updated:";
+    for (auto it = stations_updated.begin(); it != stations_updated.end(); ++it) {
+      buf += " " + *it;
+    }
+    Serial.println(buf);
+  }
+  {
+    String buf = " No report:";
+    for (auto it = stations_stale.begin(); it != stations_stale.end(); ++it) {
+      buf += " " + *it;
+    }
+    Serial.println(buf);
+  }
+  {
+    String buf = " Partial report:";
+    for (auto it = stations_no_cat.begin(); it != stations_no_cat.end(); ++it) {
+      buf += " " + *it;
+    }
+    Serial.println(buf);
+  }
 }
 
 /**
  * @brief Retrieve the weather and load the colors into the color target array.
  */
-void fetch_weather() {
+int fetch_weather() {
   auto _path = url;
   for (auto const& imap : station_lut) {
     _path.concat(imap.first + ",");
@@ -172,22 +230,50 @@ void fetch_weather() {
   if (http.begin(bear, _path)) {
     http.addHeader("User-Agent", "ESP8266");
     http.addHeader("Connection", "close");
+
     int code = http.GET();
     if (code == HTTP_CODE_OK || code == HTTP_CODE_MOVED_PERMANENTLY) {
       auto payload = http.getString();
+      if (payload.length() == 0) {
+        Serial.print("!!! Warning: server returned no data. HTTP code ");
+        Serial.print(code);
+        Serial.println(".");
+        for (int i = 0; i < http.headers(); ++i) {
+          Serial.print(" ");
+          Serial.print(http.headerName(i));
+          Serial.print(": ");
+          Serial.println(http.header(i));
+        }
+        Serial.println();
+        Serial.print(payload);
+        http.end();
+        return -4;
+      }
+
       payload_proc(payload.c_str());
+      http.end();
+      return 1;
     }
+
+    else if (code == HTTPC_ERROR_CONNECTION_REFUSED) {
+      http.end();
+      Serial.println("!!! Warning: server refused connection, trying agian shortly.");
+      return -1;
+    }
+
     else {
+      http.end();
       led_mode = led_mode_t::ERROR;
       Serial.print("!!! Error: server returned with code ");
       Serial.print(code);
       Serial.println(". !!!");
+      return -2;
     }
-    http.end();
   }
   else {
     led_mode = led_mode_t::ERROR;
     Serial.println("!!! Error: no connection to server. !!!");
+    return -3;
   }
 }
 
@@ -270,6 +356,12 @@ void led_update_handler() {
   FastLED.show();
 }
 
+void wifi_scan_complete(int networks_found)
+{
+  wifi_scan_num_results = networks_found;
+  menu = 10;
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("WxSectional JAX");
@@ -297,12 +389,12 @@ void setup() {
 
   SPIFFS.begin();
   int num_certs = certStore.initCertStore(SPIFFS, "/certs.idx", "/certs.ar");
-  Serial.print("Number of CA certs read: ");
+  Serial.print("INFO: Number of CA certs read = ");
   Serial.println(num_certs);
 }
 
 void loop() {
-  static long updated_at = LONG_MIN;
+  static long update_at = 0;
   
   static bool btn_last = HIGH;
   static long btn_pressed_at = 0;
@@ -311,14 +403,48 @@ void loop() {
   static long smart_config_started_at = 0;
 
   auto now = time(nullptr);
+  long now_ms = millis();
   bool time_is_valid = (now >= 946080000); // Allow any time in the 21st century
 
-  // Send an 
-  if (WiFi.isConnected() && time_is_valid && ((millis() - updated_at) >= (UPDATE_MINUTES * 60 * 1000))) {
+  if (menu == 0) {
+    Serial.println("Main menu");
+    Serial.println("=========");
+    Serial.println("? | Print menu");
+    Serial.println("w | Scan WiFi networks");
+    // Serial.println("W | Manually confgure WiFi");
+    Serial.println("u | Update weather now");
+    menu += 1;
+  }
+  else if (menu == 10) {
+    Serial.println("WiFi");
+    Serial.println("====");
+    Serial.println("q | Return to main menu");
+
+    for (int i = 0; i < wifi_scan_num_results; i++)
+    {
+      Serial.printf("%-2d| %s\n", i + 1, WiFi.SSID(i).c_str());
+    }
+    menu += 1;
+  }
+  else if (menu == 20) {
+    Serial.println("Password (enter for none):");
+    menu += 1;
+  }
+
+  if (WiFi.isConnected() && time_is_valid && ((now_ms - update_at) >= 0)) {
     Serial.print("Updated at ");
     Serial.print(ctime(&now));
-    fetch_weather();
-    updated_at = millis();
+
+    auto res = fetch_weather();
+    if (res > 0) {
+      update_at = now_ms + (UPDATE_MINUTES * 60 * 1000);
+      error_delay = ERROR_BACKOFF_MIN;
+    }
+    else if (res <= 0) {
+      update_at = now_ms + (error_delay * 1000);
+      error_delay *= ERROR_BACKOFF_FACTOR;
+      if (error_delay > ERROR_BACKOFF_MAX) error_delay = ERROR_BACKOFF_MAX;
+    }
   }
 
   bool btn = digitalRead(BUTTON_PIN);
@@ -347,9 +473,9 @@ void loop() {
       Serial.println("WiFi connected!");
 
       led_mode = led_mode_t::WAIT;
-      updated_at = LONG_MIN;
+      update_at = 0;
     }
-    else if ((millis() - smart_config_started_at) >= (60 * 1000)) {
+    else if ((now_ms - smart_config_started_at) >= (60 * 1000)) {
       WiFi.stopSmartConfig();
 
       smart_config = false;
@@ -358,11 +484,89 @@ void loop() {
       led_mode = led_mode_t::ERROR;
     }
     
-    auto led = ((millis() - smart_config_started_at) % 1000) >= 500;
+    auto led = ((now_ms - smart_config_started_at) % 1000) >= 500;
     digitalWrite(LED_PIN, led);
   }
   else {
     digitalWrite(LED_PIN, HIGH);
+  }
+
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    // if ((menu & 0xFE) == 0 && c == 'W') {
+    //   Serial.println("Manual WiFi configuration not implemented.");
+    //   menu = 0;
+    // }
+    if ((menu & 0xFE) == 0 && c == 'w') {
+      WiFi.disconnect();
+      Serial.println();
+      Serial.println("Scanning for WiFi networks. Please wait.");
+      Serial.println();
+      WiFi.scanNetworksAsync(wifi_scan_complete);
+      menu = 9;
+    }
+    else if ((menu & 0xFE) == 0 && (c == '?' || c == 'h' || c == 'H')) {
+      menu = 0;
+    }
+    else if ((menu & 0xFE) == 0 && c == 'u') {
+      update_at = 0;
+      menu = 0;
+    }
+    else if ((menu & 0xFE) == 10) {
+      if (c == 'q') {
+        menu_buf_len = 0;
+        menu = 0;
+        WiFi.begin();
+      }
+      if (c >= '0' && c <= '9') {
+        Serial.print(c);
+        menu_buf[menu_buf_len++] = c;
+        menu_buf[menu_buf_len] = 0;
+      }
+      if (c == '\b' && menu_buf_len > 0) {
+        menu_buf[--menu_buf_len] = 0;
+        Serial.print('\b');
+        Serial.print(' ');
+        Serial.print('\b');
+      }
+      if (c == '\n' || menu_buf_len == 3) {
+        int sel = atoi(menu_buf);
+        if (sel >= 1 && sel <= wifi_scan_num_results + 1) {
+          strcpy(wifi_ssid, WiFi.SSID(sel - 1).c_str());
+          Serial.println();
+          menu_buf_len = 0;
+          menu = 20;
+        }
+        else {
+          Serial.println();
+          Serial.println("ERROR: Invalid number.");
+          menu_buf_len = 0;
+          menu = 0;
+          WiFi.begin();
+        }
+      }
+    }
+    else if ((menu & 0xFE) == 20) {
+      if (c >= 32 && c <= 126 && menu_buf_len < 32) {
+        Serial.print(c);
+        menu_buf[menu_buf_len++] = c;
+        menu_buf[menu_buf_len] = 0;
+      }
+      if (c == '\b' && menu_buf_len > 0) {
+        menu_buf[--menu_buf_len] = 0;
+        Serial.print('\b');
+        Serial.print(' ');
+        Serial.print('\b');
+      }
+      if (c == '\n') {
+        WiFi.begin(wifi_ssid, menu_buf);
+        Serial.println();
+        Serial.print("INFO: Connecting to ");
+        Serial.println(wifi_ssid);
+        menu = 0;
+      }
+    }
   }
 
   auto wstat = WiFi.status();
@@ -381,7 +585,7 @@ void loop() {
   }
   else if (wstat == WL_CONNECTED && last_wstat != WL_CONNECTED) {
     led_mode = led_mode_t::WAIT;
-    updated_at = LONG_MIN;
+    update_at = 0;
   }
   last_wstat = wstat;
 }
